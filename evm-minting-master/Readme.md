@@ -1,117 +1,104 @@
-# ELI5
+# EVM minting
 
-NFTPort uses the contract factory pattern to make it cheaper for our end users to deploy NFT contracts via our API. When a user requests a new contract to be deployed, we deploy a [minimal immutable proxy](https://eips.ethereum.org/EIPS/eip-1167) to an already deployed contract (template implementation) instead of deploying a full copy of the bytecode.
+## Architecture overview
 
-### Terminology
+### Background & motivation
 
-**Template** - a type of contract that can be deployed by the end user. Examples of templates are: `NFTCollection`, `ERC721NFTProduct`, `ERC1155NFTProduct`
+When an NFTPort user requests to deploy a custom contract on Polygon or Rinkeby, the API submits a transaction on-chain to create a new contract with some precompiled bytecode.
+That bytecode contains the full contract code and deploying it will essentially create a complete copy on the blockchain with different initialization options.
+This is also why once we verify one instance of that contract, all other instances become verified as well - they all have identical bytecode.
 
-**Template implementation** - a contract that implements a specific version of a template which the minimal user-deployed clones delegate their logic to. Template implementations are deployed by NFTPort once per version and will be registered in the Factory. An example of a template implementation is `NFTCollection` version `1_03_02` at address `0x387a294a2B92387cf46714FaA537F1F81d50c210`
+This approach is feasible on chains where storage costs are negligible.
+If we want to expand to more expensive chains like Ethereum, deploying lots of bytecode like that will be prohibitively expensive for our users.
+To bring the costs down, EVM minting architecture uses the contract factory pattern.
 
-**Template instance** - a proxy to a specific template implementation. Template instances are the contracts that are deployed for and used by NFTPort’s end users. An example of a template instance is contract `0x377f2fd104692E592A5259cF75756037AE180fcb` which is an instance of `NFTCollection` implementation `1_03_02`
+Instead of creating new copies of a contract, only one full instance of contract bytecode is deployed.
+User-requested instances will be created as lightweight minimal proxies that delegate their logic to the one full deployment via EVM's `delegatecall` instruction.
+For more background on how those minimal proxies work, read [EIP 1167](https://eips.ethereum.org/EIPS/eip-1167) and OpenZeppelin's [Clone](https://docs.openzeppelin.com/contracts/4.x/api/proxy#Clones) documentation.
 
-# `Factory.sol`
+The result is that we can deploy arbitrary contract instances for our user's with a low, constant cost.
+For an example, a standalone `NFTCollection` costs ~3.9M gas to deploy, while a proxy can be deployed for just ~515k gas ($651 vs $85).
 
-## High-level overview
+### Contract factory
 
-`Factory.sol` is the contract factory contract. Its responsibilities include:
+`Factory.sol` is the factory contract that can be used to deploy and later manage copies of template contracts in a gas-efficient way.
 
-- Keeping track of available templates and their implementations
-- Deploying template instances
-- Managing access rights for calling deployed template instances
-- Proxying calls to deployed template instances
+The factory has the following responsibilities:
 
-Factory is deployed as an upgradable contract so it consists of a proxy and an implementation.
+1. Keeping track of templates (contracts that can be cloned)
+2. Deploying contract instances (clones of templates)
+3. Proxying calls to deployed instances
+4. Charging fees from users who want to use the factory
 
-## Roles
+### Contract templates
 
-### Proxy owner
+Contract templates are contracts that are deployed to the blockchain but cannot be initialized or used directly.
+Their only function is to store the code that proxies delegate their logic to.
 
-Owns the proxy contract for Factory, can upgrade the implementation. Should be set to a Gnosis Safe multisig.
+### Contract instances
 
-### Factory admin (`ADMIN_ROLE`)
+Contract instances are ligthweight proxies that rely on a contract implementation for their logic.
 
-Administers the factory, including registering new template implementations, managing template instance whitelist status (aka allowing or disallowing it to be called via Factory) and withdrawing any fees from the Factory.
+### Fees and fee management
 
-### Transaction signer (`SIGNER_ROLE`)
+- We have two sets of `deploy()` and `call()` functions:
+  - one that charges service fees - required for developers using NFTPort SDK or the factory directly
+  - another set that doesn't require any fees - used by our API wallets
+- How to authenticate the no-service-fee versions?
+  - can't really pre-register NFTPort API wallets in the factory - would be expensive due to the number of wallets we have (one per API key), multiple supported chains etc
+  - can't really register wallets on-demand, e.g. when a user tries to make their first deployment - would be cheaper but slows down the DX since there's an extra transaction to wait for
+- Solution: signatures
+  - we have a signer wallet and overloaded `deploy()` and `call()` methods that take a signature as an extra parameter
+  - as long as there's a valid signature, you can use these methods without any service fees
 
-Allowed to sign transaction payloads for deploying and calling template instances.
+## Release process
 
-Factory contains two sets of `deploy` and `call` methods. First set requires a signature from a wallet with the `SIGNER_ROLE`, the second one charges fees on deployments and contract calls.
+1. Deploy contracts
+2. Verify contracts
+3. Commit deployment artifacts that get generated under `deployments/<network>/<contract>.json`
+4. Tag release
 
-The latter was supposed to support a client-side NFTPort SDK library. The development of the SDK didn’t get mapped out and started, however, so these functions are currently considered deprecated and will be removed.
+## Deploying & verifying contracts
 
-The signature-based methods are the main interaction points for our API and the Factory. This design was chosen because we generate a new wallet for each NFTPort user and registering all of these wallets with the Factory would be too costly and time-consuming. Instead, any wallet that can present a valid signature from a `SIGNER_ROLE` is authorized to interact with the Factory without fees.
+Only standalone contracts should currently be deployed.
+Contracts in this repository are meant to be deployed by cloning an implementation through `Factory`.
+To enable them to be used in the current Polygon setup, where full contract bytecode is deployed directly, there are versions under `contracts/standalone` that can be used independently.
+There is a `rollout:standalone` script to simplify the process.
 
-### Contract operator (`OPERATOR_ROLE(<instance address>)`)
+```
+npm run rollout:standalone
+```
 
-Allowed to call the template instance. The role is generated based on instance address so it’s specific to each user contract. The wallet that deploys a template instance is granted its operator role by default.
+This deploys all standalone contracts to both Rinkeby and Polygon and verifies them with Etherscan and Polygonscan.
 
-### Unprivileged user
+## Release tagging
 
-Actions currently available to an unprivileged user are deploying/calling template instances by paying fees (deprecated and will be removed) and calling the Factory’s `upgrade()` function to run migrations between versions. In practice, `upgrade()` is called atomically when the proxy implementation is upgraded so this action should effectively not be available.
+Release tags have the format of `<component>/<version>`, such as `Factory/1_00_00` or `NFTCollection/1_00_00`.
+Tag the commit that contains the updated deployment artifacts (`deployments/` folder).
 
-# `NFTCollection.sol`
+## Sample code
 
-## High-level overview
+There are some code samples for interacting with the contract factory using `web3.js` in `scripts/sample-code.js`.
+To run the samples, first start a local Hardhat node with `npm run node` and then run the script with `node scripts/sample-code.js`.
 
-`NFTCollection` is a template implementing the popular 10k profile picture type of NFT project format. It is configurable to reproduce a range of functionality that is common in similar contracts. Configuration is divided into two parts:
+## Sending transactions to Factory via Gnosis
 
-- `DeploymentConfig` is set at contract creation time and cannot be changed later. This includes options like max supply, token name and symbol etc. The exception is the `owner` property that cannot be changed by normal contract update methods but by explicitly calling `transferOwnership` in order to implement `Ownable`
-- `RuntimeConfig` is configuration that can be changed after the contract has been created. Some options are accompanied by a flag to freeze them and lock out any future changes.
+1. Write your contract call code in `scriptes/generate-gnosis-tx.js`
+2. Execute `npm run gnosis:<rinkeby|mainnet>`
+3. Open up the Gnosis Safe URL
+4. Click `New transaction` -> `Contract interaction` -> toggle `Use custom data (hex encoded)`
+5. Copy in the values from step 2
+6. Sign and execute the transaction
 
-## Roles
+## Development cookbook
 
-### Contract owner
+### Getting multiple versions of NFTCollection deployed locally
 
-The guiding principle for designing access controls for this contract was that functional access will be delegated to NFTPort’s execution wallet but our end users are the ultimate custodians of their contracts. They are free to revoke NFTPort’s access to their contract and stop using our API if they so choose. This is expressed by the contract owner role which also gets the root admin role from `AccessControl`.
-
-### `AccessControl` root role (`DEFAULT_ADMIN_ROLE`)
-
-Granted to the contract owner and moves alongside contract ownership.
-
-### Contract admin (`ADMIN_ROLE`)
-
-Allowed to update contract configuration and mint from the reserved supply. This is the role that is granted to NFTPort’s execution wallet.
-
-### Unprivileged user
-
-Allowed to mint either via regular `mint()` or, if whitelisted, using `presaleMint()`
-
-# `ERC721NFTProduct.sol`, `ERC1155NFTProduct.sol`
-
-What we call “product contracts” are very simple NFT contracts that expose core NFT functionality (mints, metadata updates, burns, transfers) and leave implementing the business logic to the user’s API or service. There are two such templates, one implementing the ERC-721 token standard and the other implementing ERC-1155. Similarly to `NFTCollection` they are configurable with options split between deployment-time and runtime-updatable sets.
-
-## Roles
-
-### Contract owner
-
-The ultimate owner of the contract, similar to `NFTCollection`
-
-### Contract admin (`ADMIN_ROLE`)
-
-Superuser role that has the privileges of all other roles (with the exception of contract ownership).
-
-### Minter (`MINT_ROLE`)
-
-Allowed to mint new tokens.
-
-### Contract updater (`UPDATE_CONTRACT_ROLE`)
-
-Allowed to update contract configuration.
-
-### Token updater (`UPDATE_TOKEN_ROLE`)
-
-Allowed to update token metadata.
-
-### Token burner (`BURN_ROLE`)
-
-Allowed to burn tokens that belong to the contract owner.
-
-### Token transferrer (`TRANSFER_ROLE`)
-
-Allowed to transfer tokens that belong to the contract owner.
-
-### Unprivileged user
-
-Should have no special rights besides standard ERC-721/1155 functionality.
+1. Check out an older version of the contract, e.g. `git checkout NFTCollection/1_02_01`
+2. Start local Hardhat node with `npm run node`. This will also execute all the deployment scripts from `deploy/`. Do not stop this node during later steps.
+3. Deploy a test collection.
+   3a. For `1_02_01` or any other revisions: run `npx hardhat run --network localhost scripts/create-test-collection.js`.
+   3b. Otherwise run `npm run create-test-collection`
+4. Check out another version, e.g. `git checkout <branch>`
+5. Run deployment scripts to deploy and upgrade the Factory to the latest collection template with `npm run deploy:localhost`
+6. Deploy a test collection with `npm run create-test-collection`
