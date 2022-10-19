@@ -9,6 +9,7 @@
 
 # Resources
 
+- [High-level overview of contracts & roles](evm-minting-master/Readme.md)
 - [Website](https://www.nftport.xyz/)
 - [Twitter](https://twitter.com/nftport_xyz)
 - [Docs](https://docs.nftport.xyz/docs/nftport)
