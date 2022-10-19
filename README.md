@@ -16,8 +16,17 @@
 
 # Audit scope
 
-TBD
+```
+Factory.sol
+Base64.sol
+ERC2981.sol
+Config.sol
+GranularRoles.sol
+NFTCollection.sol
+ERC721NFTProduct.sol
+ERC1155NFTProduct.sol
+```
 
 # About NFTPort
 
-TBD
+NFTPort is Stripe for NFTs: a One-Stop, Simple and Developer-Friendly NFT Infrastructure & APIs to help developers bring their NFT applications to market in hours instead of months. We take care of the NFT infrastructure so you can focus on your application. Built by developers for developers.
